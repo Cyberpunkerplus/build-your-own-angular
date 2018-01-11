@@ -1,5 +1,5 @@
 /* jshint globalstrict: true */
-/* global angular: false */
+/* global angular: false, HashMap: false */
 'use strict';
 
 var FN_ARGS = /^function\s*[^\(]*\(\s*([^\)]*)\)/m;
@@ -11,7 +11,7 @@ function createInjector(modulesToLoad, strictDi){
     var cache = {};
     var providerCache = {};
     var instanceCache = {};
-    var loadedModules = {};
+    var loadedModules = new HashMap();
     var path = [];
     strictDi = (strictDi === true);
     var providerInjector = providerCache.$injector = createInternalInjector(providerCache, function(){
@@ -79,6 +79,16 @@ function createInjector(modulesToLoad, strictDi){
             instantiate: instantiate
         };
     }
+
+    function enforceReturnValue(factoryFn){
+        return function(){
+            var value = instanceInjector.invoke(factoryFn);
+            if(_.isUndefined(value)) {
+                throw 'factory must return a value';
+            }
+            return value;
+        };
+    }
     providerCache.$provide = {
         constant: function(key, value){
             if (key === 'hasOwnProperty') {
@@ -92,6 +102,28 @@ function createInjector(modulesToLoad, strictDi){
                 provider = providerInjector.instantiate(provider);
             }
             providerCache[key + 'Provider'] = provider;
+        },
+        factory: function(key, factoryFn, enforce) {
+            this.provider(key, {
+                $get: enforce === false ? factoryFn : enforceReturnValue(factoryFn)
+            });
+        },
+        value: function(key, value) {
+            this.factory(key, _.constant(value), false);
+        },
+        service: function(key, Constructor) {
+            this.factory(key, function(){
+                return instanceInjector.instantiate(Constructor);
+            });
+        },
+        decorator: function(serviceName, decoratorFn) {
+            var provider = providerInjector.get(serviceName + 'Provider');
+            var original$get = provider.$get;
+            provider.$get = function() {
+                var instance = instanceInjector.invoke(original$get, provider);
+                instanceInjector.invoke(decoratorFn, null, {$delegate: instance});
+                return instance;
+            };
         }
     };
     function annotate(fn){
@@ -119,18 +151,30 @@ function createInjector(modulesToLoad, strictDi){
             var service = providerInjector.get(invokeArgs[0]);
             var method = invokeArgs[1];
             var args = invokeArgs[2];
-            providerCache.$provide[method].apply(providerCache.$provide, args);
+            service[method].apply(service, args);    
         });
     }
     
+    var runBlocks = [];
     _.forEach(modulesToLoad, function loadModule(moduleName){
-        if(!loadedModules.hasOwnProperty(moduleName)){
-            loadedModules[moduleName] = true;
-            var module = angular.module(moduleName);
-            _.forEach(module.requires, loadModule);
-            runInvokeQueue(module._invokeQueue);
-            runInvokeQueue(module._configBlocks);
+        if (!loadedModules.get(moduleName)) {
+            loadedModules.put(moduleName, true);
+            if(_.isString(moduleName)) {
+                var module = angular.module(moduleName);
+                _.forEach(module.requires, loadModule);
+                runInvokeQueue(module._invokeQueue);
+                runInvokeQueue(module._configBlocks);
+                runBlocks = runBlocks.concat(module._runBlocks);
+                
+            } else if (_.isFunction(moduleName) || _.isArray(moduleName)) {
+                runBlocks.push(providerInjector.invoke(moduleName));
+            }
         }
+        
+        
+    });
+    _.forEach(_.compact(runBlocks), function(runBlock){
+        instanceInjector.invoke(runBlock);
     });
 
     return instanceInjector;
